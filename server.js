@@ -52,6 +52,52 @@ async function fetchModelsFromAPI(apiKey) {
   }
 }
 
+// small helper to pause
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function parseRetryDelayFromError(err) {
+  try {
+    const details = err.errorDetails || err?.errorDetails || [];
+    for (const d of details) {
+      if (d['@type'] && d['@type'].includes('RetryInfo') && d.retryDelay) {
+        // retryDelay is like '48s' or '50s'
+        const m = String(d.retryDelay).match(/(\d+)(?:s)?/);
+        if (m) return parseInt(m[1], 10) * 1000;
+      }
+    }
+  } catch (e) { /* ignore */ }
+  return null;
+}
+
+async function callGenerateWithRetry(model, input, maxAttempts = 3) {
+  let attempt = 0;
+  let lastErr = null;
+  while (attempt < maxAttempts) {
+    try {
+      const result = await model.generateContent(input);
+      const response = await result.response;
+      const text = response.text();
+      return { text };
+    } catch (err) {
+      lastErr = err;
+      if (err && err.status === 429) {
+        const retryMs = parseRetryDelayFromError(err) || Math.min(60000, Math.pow(2, attempt) * 1000);
+        console.warn(`Rate limited by Gemini. Attempt ${attempt + 1}/${maxAttempts}. Retrying in ${retryMs/1000}s`);
+        await sleep(retryMs);
+        attempt += 1;
+        continue;
+      }
+      // non-rate-limit error -> rethrow
+      throw err;
+    }
+  }
+  // exhausted attempts
+  const finalErr = lastErr || new Error('generateContent failed');
+  throw finalErr;
+}
+
 // Model selection logic with System Instructions injected
 let modelPromise = (async () => {
   // Prefer the REST list (more reliable across SDK versions)
@@ -84,13 +130,34 @@ app.post('/chat', async (req, res) => {
 
     const userMessage = messages[messages.length - 1].content;
     const model = await modelPromise;
-
-    // Send content to Gemini
-    const result = await model.generateContent(userMessage);
-    const response = await result.response;
-    const text = response.text();
-
-    res.json({ role: 'assistant', content: text });
+    // Send content to Gemini with retry/backoff for 429s
+    try {
+      const { text } = await callGenerateWithRetry(model, userMessage, 3);
+      return res.json({ role: 'assistant', content: text });
+    } catch (err) {
+      // If rate-limited even after retries, try a fallback model (if configured)
+      console.warn('Primary model failed:', err?.message || err);
+      if (err && err.status === 429) {
+        const retryMs = parseRetryDelayFromError(err);
+        // Attempt fallback once
+        const fallbackName = process.env.GEMINI_FALLBACK_MODEL || process.env.GEMINI_MODEL || 'models/gemini-flash-latest';
+        try {
+          console.log('Attempting fallback model:', fallbackName);
+          const fallbackModel = genAI.getGenerativeModel({ model: fallbackName, systemInstruction: ZIA_SYSTEM_INSTRUCTIONS });
+          const { text } = await callGenerateWithRetry(fallbackModel, userMessage, 2);
+          return res.json({ role: 'assistant', content: text, fallback: fallbackName });
+        } catch (fbErr) {
+          const retrySeconds = retryMs ? Math.ceil(retryMs / 1000) : undefined;
+          console.error('Fallback model also failed:', fbErr?.message || fbErr);
+          return res.status(429).json({
+            error: 'Rate limited by Gemini API',
+            message: 'Quota exceeded or rate limited. Please retry after the indicated time.',
+            retryAfterSeconds: retrySeconds
+          });
+        }
+      }
+      throw err;
+    }
   } catch (error) {
     console.error("Gemini Error:", error);
     res.status(500).json({ error: "Zia connection failed. Check your API key." });

@@ -21,6 +21,7 @@ export default function ChatScreen() {
   const router = useRouter(); // Initialize router
   const [input, setInput] = useState('');
   const [messages, setMessages] = useState<Message[]>([]);
+  const messagesRef = useRef<Message[]>([]);
   const [isTyping, setIsTyping] = useState(false);
   const flatListRef = useRef<FlatList>(null);
   
@@ -59,7 +60,11 @@ export default function ChatScreen() {
       timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
     };
 
-    setMessages(prev => [...prev, userMsg]);
+    setMessages(prev => {
+      const next = [...prev, userMsg];
+      messagesRef.current = next;
+      return next;
+    });
     setInput('');
     setIsTyping(true);
 
@@ -67,7 +72,8 @@ export default function ChatScreen() {
       const response = await fetch(API_URL, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ messages: [...messages, userMsg] }),
+        // use messagesRef to ensure we send the latest conversation (including just-added user message)
+        body: JSON.stringify({ messages: messagesRef.current }),
       });
 
       if (!response.ok) throw new Error();
@@ -81,7 +87,11 @@ export default function ChatScreen() {
         timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
       };
 
-      setMessages(prev => [...prev, botMsg]);
+      setMessages(prev => {
+        const next = [...prev, botMsg];
+        messagesRef.current = next;
+        return next;
+      });
     } catch (error) {
       Alert.alert("Link Failure", "The Nexus link was severed. Is the server online?");
     } finally {
